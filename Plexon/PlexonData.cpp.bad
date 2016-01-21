@@ -1,0 +1,153 @@
+#include "stdafx.h"
+#include "PlexonData.h"
+#include "MatlabHelper.h"
+
+#pragma comment (lib, "PlexClient.lib")
+
+PlexonData::PlexonData(CDialogEx *parent):
+    pServerEventBuffer(NULL), 
+    windowSizeInMs(50),
+    windowSizeInTimeStamp(50*40000)
+{
+    mainWindow = parent;
+}
+
+
+PlexonData::~PlexonData(void) {
+    if (pServerEventBuffer) {
+        free(pServerEventBuffer);
+    }
+    PL_CloseClient();
+}
+
+bool PlexonData::Init() {
+    pServerEventBuffer = (PL_Event*)malloc(sizeof(PL_Event) * MAX_MAP_EVENTS_PER_READ);
+    if (pServerEventBuffer == NULL) {
+        MessageBox(mainWindow->GetSafeHwnd(), L"Couldn't allocate memory!", L"Error", MB_OK);
+        return false;
+    }
+    return true;
+}
+
+int PlexonData::ReadSpike() {
+    int num_events = MAX_MAP_EVENTS_PER_READ;
+    PL_GetTimeStampStructures(&num_events, pServerEventBuffer);
+
+	/*CString txt;
+	txt.Format(L"num_event %d" , num_events);
+	MessageBox(mainWindow->GetSafeHwnd(), txt, L"INFO", MB_OK);*/
+
+    int num_spike_timestamps = 0;
+    for (int i = 0; i < num_events; i++) {
+		unsigned long time_stamp = pServerEventBuffer[i].TimeStamp;
+		int batch_index = time_stamp / windowSizeInTimeStamp - initalBatchNumber;
+		if (sampleDataBatch.size() <= batch_index) {
+            sampleDataBatch.resize(batch_index + 1);
+            //int oldSize = sampleDataStatistics.size();
+            sampleDataStatistics.resize(batch_index + 1);
+        }
+
+        if (pServerEventBuffer[i].Type == PL_SingleWFType) {
+            sampleDataBatch[batch_index].push_back(SampleDataType(
+                pServerEventBuffer[i].TimeStamp,
+                pServerEventBuffer[i].Unit,
+                pServerEventBuffer[i].Channel ));
+            short channel = pServerEventBuffer[i].Channel;
+            sampleDataStatistics[batch_index].val[channel]++;
+            num_spike_timestamps ++;
+        } else if (pServerEventBuffer[i].Type == PL_ExtEventType) {
+            switch (pServerEventBuffer[i].Channel) {
+            case PL_StrobedExtChannel:
+            case PL_StartExtChannel:
+            case PL_StopExtChannel:
+            case PL_Pause:
+            case PL_Resume:
+                break;
+            default:
+                sampleDataStatistics[batch_index].val[pServerEventBuffer[i].Channel + MAX_SPIKE_CHANNEL_NUMBER]++;
+            }
+        }
+    }
+
+    return num_spike_timestamps;
+}
+
+bool PlexonData::ConnectDataServer() {
+    PL_CloseClient();
+    int h = PL_InitClientEx3(0, NULL, mainWindow->GetSafeHwnd());
+    int time_stamp_tick = PL_GetTimeStampTick();
+    switch (time_stamp_tick) {
+    case 25: 
+        mapSampleRate = 40000;
+    	break;
+    case 40:
+        mapSampleRate = 25000;
+        break;
+    case 50:
+        mapSampleRate = 20000;
+        break;
+    default:
+        MessageBox(mainWindow->GetSafeHwnd(), L"Unsupported MAP sampling time, I can't continue!\r\n", L"Error", MB_OK);
+        mapSampleRate = 40000*25/time_stamp_tick;
+        return false;
+    }
+    windowSizeInTimeStamp = windowSizeInMs * mapSampleRate / 1000;
+    
+    // set the initial time stamp;
+    // SetupInitBatchNumber();
+    return true;
+}
+
+void PlexonData::SetupInitBatchNumber() {
+    Sleep(10);
+    int num_events = MAX_MAP_EVENTS_PER_READ;
+    PL_GetTimeStampStructures(&num_events, pServerEventBuffer);
+    unsigned long init_time_stamp = pServerEventBuffer[num_events - 1].TimeStamp;
+    initalBatchNumber = init_time_stamp / windowSizeInTimeStamp;
+    Sleep(10);
+}
+
+int PlexonData::SaveData(const std::string &mat_filename, 
+                          int neuron_channel_start, int neuron_channel_number, 
+                          int motion_channel_start, int motion_channel_number) {
+    // convert the data to flat matrix
+    int num_bin = sampleDataStatistics.size();
+    if (num_bin == 0) {
+        return -1;
+    }
+    std::vector<double> neuron_mat(num_bin * neuron_channel_number);
+    std::vector<double> motion_mat(num_bin * motion_channel_number);
+    for (int bin_index = 0; bin_index < num_bin; bin_index++) {
+        for (int i = 0; i < neuron_channel_number; i++) {
+            neuron_mat[i*num_bin + bin_index] = sampleDataStatistics[bin_index].val[neuron_channel_start + i];
+        }
+        for (int i = 0; i < motion_channel_number; i++) {
+            motion_mat[i*num_bin + bin_index] = sampleDataStatistics[bin_index].val[motion_channel_start + i];
+        }
+    }
+
+    MatlabHelper::save_data(mat_filename, num_bin, neuron_channel_number, motion_channel_number, &neuron_mat[0], &motion_mat[0]);
+    return 0;
+}
+
+void PlexonData::Train(const std::string &data_filename, int num_epo, int workmode) {
+    MatlabHelper::train(data_filename, num_epo, workmode);
+}
+
+bool PlexonData::Test(const std::string &model_filename, int neuron_channel_start, int neuron_channel_number, int motion_channel_number, int num_epo, std::vector<double> &res) {
+    // if successfully test , return true
+    // else (the sampled data is too short) return false
+    int sampled_bin_size = (int)sampleDataStatistics.size();
+    int start_bin_index = sampled_bin_size - num_epo - 1;
+    if (start_bin_index < 0) return false;
+    std::vector<double> neuron_mat(num_epo * neuron_channel_number);
+    std::vector<double> predicted_res(motion_channel_number);
+
+    for (int bin_index = 0; bin_index < num_epo; bin_index++) {
+        for (int i = 0; i < neuron_channel_number; i++){
+            neuron_mat[i*num_epo + bin_index] = sampleDataStatistics[bin_index + start_bin_index].val[neuron_channel_start + i];
+        }
+    }
+    MatlabHelper::test(&neuron_mat[0], num_epo, neuron_channel_number, motion_channel_number, model_filename, predicted_res);
+    return true;
+}
